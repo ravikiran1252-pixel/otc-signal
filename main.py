@@ -170,27 +170,71 @@ def build_signal(candles):
 # ── QUOTEX CONNECTION ───────────────────────
 sessions = {}  # email -> client
 
-async def get_quotex_candles(email, password, asset):
+async def get_quotex_candles(email, password, asset, otp=None):
     try:
         from pyquotex.stable_api import Quotex
-        client = Quotex(email=email, password=password, lang="en")
-        ok, msg = await client.connect()
+        import os
+
+        # Save credentials to file so pyquotex can reuse session
+        cred_dir = f"/tmp/qx_{email.replace('@','_').replace('.','_')}"
+        os.makedirs(cred_dir, exist_ok=True)
+
+        client = Quotex(
+            email=email,
+            password=password,
+            lang="en",
+            root_path=cred_dir
+        )
+
+        # Monkey-patch input() to return OTP or empty string
+        # This prevents "EOF when reading a line" error
+        import builtins
+        original_input = builtins.input
+        def fake_input(prompt=""):
+            if otp and ("code" in prompt.lower() or "otp" in prompt.lower() or "verif" in prompt.lower()):
+                return str(otp)
+            return ""
+        builtins.input = fake_input
+
+        try:
+            ok, msg = await client.connect()
+        finally:
+            builtins.input = original_input
+
         if not ok:
+            # Check if OTP is needed
+            if "code" in str(msg).lower() or "verif" in str(msg).lower() or "otp" in str(msg).lower():
+                return None, "OTP_REQUIRED"
             return None, f"Login failed: {msg}"
+
         raw = await client.get_candles(asset, 60, 200)
         await client.close()
+
         if not raw:
-            return None, "No candles received"
+            return None, "No candles received. Market may be closed."
+
         candles = []
         for c in raw:
-            candles.append({
-                'close': float(c.get('close', 0)),
-                'open':  float(c.get('open', 0)),
-                'high':  float(c.get('max', c.get('high', 0))),
-                'low':   float(c.get('min', c.get('low', 0))),
-            })
+            try:
+                candles.append({
+                    'close': float(c.get('close', 0)),
+                    'open':  float(c.get('open', 0)),
+                    'high':  float(c.get('max', c.get('high', 0))),
+                    'low':   float(c.get('min', c.get('low', 0))),
+                })
+            except:
+                continue
+
+        if not candles:
+            return None, "No valid candle data received"
+
         return candles, None
+
+    except EOFError:
+        return None, "OTP_REQUIRED"
     except Exception as e:
+        if "EOF" in str(e) or "input" in str(e).lower():
+            return None, "OTP_REQUIRED"
         return None, str(e)
 
 # ── API ROUTES ──────────────────────────────
@@ -199,15 +243,18 @@ class SignalRequest(BaseModel):
     password: str
     pair: str
     asset: str
+    otp: str = ""
 
 @app.post("/api/signal")
 async def generate_signal(req: SignalRequest):
-    candles, err = await get_quotex_candles(req.email, req.password, req.asset)
+    candles, err = await get_quotex_candles(req.email, req.password, req.asset, req.otp or None)
+    if err == "OTP_REQUIRED":
+        raise HTTPException(status_code=401, detail="OTP_REQUIRED")
     if err:
         raise HTTPException(status_code=400, detail=err)
     result = build_signal(candles)
     if not result:
-        raise HTTPException(status_code=400, detail="Not enough data")
+        raise HTTPException(status_code=400, detail="Not enough data to compute signal")
     result['pair'] = req.pair
     return result
 
@@ -367,7 +414,15 @@ input::placeholder{color:#444466}
   </div>
   <div class="err" id="errBox"></div>
 
-  <div class="result" id="result">
+  <!-- OTP BOX -->
+<div id="otpBox" style="display:none;background:#111127;border:1px solid #7c3aed44;border-radius:16px;padding:20px;margin-top:14px">
+  <div style="font-size:14px;font-weight:700;color:#9b7fff;margin-bottom:6px">📧 Verification Required</div>
+  <div style="font-size:13px;color:#6b7ab5;margin-bottom:14px;line-height:1.6">Quotex sent a verification code to your email <b style="color:#e2e8ff">ravishiyaan08@yahoo.com</b>. Enter it below:</div>
+  <input id="otpInput" type="number" placeholder="Enter 6-digit code" style="width:100%;background:#1a1a2e;border:1px solid #7c3aed;border-radius:10px;padding:14px;color:#e2e8ff;font-size:18px;text-align:center;letter-spacing:4px;margin-bottom:10px;font-family:monospace"/>
+  <button onclick="submitOTP()" style="width:100%;padding:14px;border-radius:12px;background:#7c3aed;color:#fff;font-weight:800;font-size:15px;border:none;cursor:pointer">✓ Verify & Get Signal</button>
+</div>
+
+<div class="result" id="result">
     <div class="sig-card" id="sigCard">
       <div class="sig-dir" id="sigDir">↑</div>
       <div class="sig-label" id="sigLabel">BUY / CALL</div>
@@ -437,25 +492,53 @@ var msgs=['📡 Connecting to Quotex…','🔐 Authenticating…','📊 Fetching
 var mi=0,mTick=null;
 function cycleMsg(){if(mi<msgs.length){document.getElementById('loadMsg').textContent=msgs[mi++];mTick=setTimeout(cycleMsg,1200);}}
 
+var pendingReq=null;
+
 async function generate(){
   var creds=getCreds();
   if(!creds.email||!creds.password){showErr('Please enter your Quotex email and password.');return;}
   var sel=document.getElementById('pairSelect');
   var asset=sel.value;
   var pairName=sel.options[sel.selectedIndex].text;
+  pendingReq={email:creds.email,password:creds.password,pair:pairName,asset:asset};
+  await doRequest(pendingReq,'');
+}
+
+async function doRequest(req, otp){
   showLoad();mi=0;cycleMsg();
   document.getElementById('genBtn').disabled=true;
   try{
+    var body=Object.assign({},req,{otp:otp});
     var res=await fetch('/api/signal',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({email:creds.email,password:creds.password,pair:pairName,asset:asset})});
+      body:JSON.stringify(body)});
+    if(res.status===401){
+      // OTP required
+      clearTimeout(mTick);hideLoad();
+      showOTPBox();
+      document.getElementById('genBtn').disabled=false;
+      return;
+    }
     if(!res.ok){var e=await res.json();throw new Error(e.detail||'Server error');}
     var data=await res.json();
     clearTimeout(mTick);hideLoad();
-    showResult(data,pairName);
+    document.getElementById('otpBox').style.display='none';
+    showResult(data,req.pair);
   }catch(e){
     clearTimeout(mTick);showErr(e.message);
   }
   document.getElementById('genBtn').disabled=false;
+}
+
+function showOTPBox(){
+  document.getElementById('otpBox').style.display='block';
+  document.getElementById('otpInput').focus();
+}
+
+async function submitOTP(){
+  var code=document.getElementById('otpInput').value.trim();
+  if(!code){alert('Please enter the OTP code sent to your email.');return;}
+  document.getElementById('otpBox').style.display='none';
+  await doRequest(pendingReq, code);
 }
 
 function showResult(d,pairName){
