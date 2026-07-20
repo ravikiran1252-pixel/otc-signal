@@ -166,7 +166,15 @@ def build_signal(candles):
 async def get_quotex_candles(email, password, asset, otp=None):
     try:
         import websockets, urllib.parse
-        session = urllib.parse.unquote(password.strip())
+        # Use env var cookie if available (most reliable)
+        env_cookie = os.environ.get('QX_COOKIE', '')
+        env_email  = os.environ.get('QX_EMAIL', email)
+        env_pass   = os.environ.get('QX_PASSWORD', password)
+        # Prefer env cookie, then user-provided cookie, then password
+        raw_session = env_cookie or password
+        session = urllib.parse.unquote(raw_session.strip())
+        email = env_email
+        password = env_pass
         candles = []
         uri = "wss://qxbroker.com/socket.io/?EIO=4&transport=websocket"
         headers = {
