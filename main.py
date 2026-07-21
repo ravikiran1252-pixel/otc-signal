@@ -234,33 +234,17 @@ async def get_quotex_candles(email, password, asset, otp=None):
             return candles, None
         raise Exception(f"WebSocket got {len(candles)} candles")
     except Exception as ws_err:
-        # Fallback: pyquotex with OTP support
+        # Fallback: pyquotex with persistent session cache
         try:
-            from pyquotex.stable_api import Quotex
-            user_data_dir = f"/tmp/qx_{hashlib.md5(email.encode()).hexdigest()[:8]}"
-            os.makedirs(user_data_dir, exist_ok=True)
-            orig = builtins.input
-            def fake(prompt=""):
-                if otp: return str(otp)
-                raise EOFError("need OTP")
-            builtins.input = fake
-            try:
-                client = Quotex(email=email, password=password, lang="en", user_data_dir=user_data_dir)
-                ok, msg = await asyncio.wait_for(client.connect(), timeout=45)
-                if not ok:
-                    s=str(msg).lower()
-                    if any(x in s for x in ['otp','eof','unknown','email','change','verify']):
-                        return None, "OTP_REQUIRED"
-                    return None, f"Login failed: {msg}"
-                raw = await asyncio.wait_for(client.get_candles(asset, 60, 200), timeout=30)
-                await client.close()
-            except EOFError:
-                return None, "OTP_REQUIRED"
-            except asyncio.TimeoutError:
-                return None, "Timeout"
-            finally:
-                builtins.input = orig
-            if not raw: return None, "No candles"
+            client, err = await get_or_create_client(email, password, otp)
+            if err:
+                return None, err
+            raw = await asyncio.wait_for(client.get_candles(asset, 60, 200), timeout=30)
+            if not raw:
+                # Session may have expired, remove from cache and retry
+                cache_key = hashlib.md5(email.encode()).hexdigest()[:8]
+                _client_cache.pop(cache_key, None)
+                return None, "No candles — session expired, try again"
             candles2=[]
             for x in raw:
                 try:
@@ -277,6 +261,52 @@ async def get_quotex_candles(email, password, asset, otp=None):
                 return None, "OTP_REQUIRED"
             return None, f"{str(e)} | WS: {str(ws_err)}"
 
+# Global client cache - keeps session alive between requests
+_client_cache = {}
+
+async def get_or_create_client(email, password, otp=None):
+    """Get cached client or create new one with session"""
+    import urllib.parse
+    cache_key = hashlib.md5(email.encode()).hexdigest()[:8]
+    
+    # Check if we have a working cached client
+    if cache_key in _client_cache:
+        client = _client_cache[cache_key]
+        try:
+            # Test if still connected
+            if hasattr(client, 'websocket') and client.websocket:
+                return client, None
+        except: pass
+    
+    # Create new client
+    from pyquotex.stable_api import Quotex
+    user_data_dir = f"/tmp/qx_{cache_key}"
+    os.makedirs(user_data_dir, exist_ok=True)
+    
+    orig = builtins.input
+    def fake(prompt=""):
+        if otp: return str(otp)
+        raise EOFError("need OTP")
+    builtins.input = fake
+    
+    try:
+        client = Quotex(email=email, password=password, lang="en", user_data_dir=user_data_dir)
+        ok, msg = await asyncio.wait_for(client.connect(), timeout=60)
+        if not ok:
+            s = str(msg).lower()
+            if any(x in s for x in ['otp','eof','unknown','email','change','verify','invalid']):
+                return None, "OTP_REQUIRED"
+            return None, f"Login failed: {msg}"
+        # Cache the working client
+        _client_cache[cache_key] = client
+        return client, None
+    except EOFError:
+        return None, "OTP_REQUIRED"
+    except asyncio.TimeoutError:
+        return None, "Timeout connecting"
+    finally:
+        builtins.input = orig
+
 class SignalRequest(BaseModel):
     email: str
     password: str
@@ -289,6 +319,7 @@ async def generate_signal(req: SignalRequest):
     candles, err = await get_quotex_candles(req.email, req.password, req.asset, req.otp or None)
     if err == "OTP_REQUIRED":
         raise HTTPException(status_code=401, detail="OTP_REQUIRED")
+    # Also catch repeated OTP requests
     if err:
         raise HTTPException(status_code=400, detail=err)
     result = build_signal(candles)
@@ -562,3 +593,4 @@ function startCd(){
   },500);
 }
 </script></body></html>"""
+# This file has the session persistence fix above
