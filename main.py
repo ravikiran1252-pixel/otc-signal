@@ -332,6 +332,21 @@ async def generate_signal(req: SignalRequest):
 def health():
     return {"status":"ok"}
 
+class PhoneSignalRequest(BaseModel):
+    pair: str
+    candles: list
+
+@app.post("/api/signal-from-phone")
+async def signal_from_phone(req: PhoneSignalRequest):
+    """Accepts real candles from phone bridge and returns signal"""
+    if not req.candles or len(req.candles) < 30:
+        raise HTTPException(status_code=400, detail=f"Need at least 30 candles, got {len(req.candles) if req.candles else 0}")
+    result = build_signal(req.candles)
+    if not result:
+        raise HTTPException(status_code=400, detail="Could not compute signal")
+    result['pair'] = req.pair
+    return result
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML
